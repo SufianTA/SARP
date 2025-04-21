@@ -1,13 +1,14 @@
 import streamlit as st
 import pandas as pd
-from modules.airnow_api import get_airnow_data
-from modules.openaq_api import fetch_openaq_timeseries
+import datetime
+import requests
 import plotly.express as px
 import folium
 from streamlit_folium import folium_static
 from folium.plugins import HeatMap
-import datetime
-import requests
+
+from modules.airnow_api import get_airnow_data
+from modules.openaq_api import fetch_openaq_timeseries, list_openaq_locations_and_parameters
 
 st.set_page_config(page_title="NASA SARP - Complete Dashboard", layout="wide")
 st.title("🌍 NASA SARP - U.S. Air Quality & Satellite Dashboard")
@@ -25,7 +26,7 @@ with st.expander("📘 What this dashboard does"):
     ✅ Toggle satellite imagery overlays
     """)
 
-# Default Cities
+# --- Default Cities ---
 common_cities = [
     {"name": "Los Angeles", "lat": 34.05, "lon": -118.25},
     {"name": "New York", "lat": 40.71, "lon": -74.01},
@@ -35,15 +36,14 @@ common_cities = [
     {"name": "San Francisco", "lat": 37.77, "lon": -122.42}
 ]
 
-# Sidebar Inputs
+# --- Sidebar Configuration ---
 st.sidebar.header("🔧 Configuration")
 api_key = st.sidebar.text_input("🔑 EPA AirNow API Key", type="password")
-openaq_key = st.sidebar.text_input("🧪 OpenAQ API Key (optional)", type="password")
+openaq_key = st.sidebar.text_input("🧪 OpenAQ API Key", type="password")
 
 default_city_names = [c["name"] for c in common_cities]
 selected_cities = st.sidebar.multiselect("📍 Select Cities", default_city_names, default=default_city_names)
 
-# Add Custom City
 st.sidebar.markdown("### ➕ Add Custom City")
 custom_name = st.sidebar.text_input("City Name")
 custom_lat = st.sidebar.text_input("Latitude")
@@ -56,16 +56,36 @@ if custom_name and custom_lat and custom_lon:
     except:
         st.sidebar.warning("Invalid lat/lon for custom city.")
 
-# Chart Config
-chart_type = st.sidebar.radio("📊 Time-Series Chart Type", ["Line", "Bar", "Area"])
+chart_type = st.sidebar.radio("📊 Chart Type", ["Line", "Bar", "Area"])
+
+# --- Dynamically list OpenAQ locations and sensors ---
+st.sidebar.markdown("### 📈 Time-Series Configuration")
+ts_locations = []
+ts_parameters = []
+
+if openaq_key:
+    try:
+        loc_map = list_openaq_locations_and_parameters(api_key=openaq_key)
+        ts_locations = sorted(loc_map.keys())
+    except Exception as e:
+        st.sidebar.warning(f"Failed to fetch OpenAQ locations: {e}")
+
+if not ts_locations:
+    ts_locations = ["Long Beach-Wintersburg"]
+
+selected_location = st.sidebar.selectbox("OpenAQ Location", ts_locations)
+
+try:
+    loc_map = list_openaq_locations_and_parameters(api_key=openaq_key)
+    ts_parameters = loc_map.get(selected_location, ["pm25"])
+except:
+    ts_parameters = ["pm25"]
+
+ts_days = st.sidebar.slider("📆 Days Back", 1, 14, 7)
+
 run = st.sidebar.button("🚀 Run Dashboard")
 
-# Hardcoded fallback values
-ts_location = "Los Angeles-North Main Street"
-ts_param = "pm25"
-ts_days = 7
-
-# --- RUN DASHBOARD ---
+# --- Main Run Block ---
 if not api_key:
     st.warning("❗ Please enter a valid EPA AirNow API key.")
 elif run:
@@ -104,81 +124,101 @@ elif run:
     else:
         st.error("No data returned from EPA AirNow for selected cities.")
 
-    # --- Time-Series Section ---
+    # --- Time-Series All Parameters ---
     st.subheader("📈 Historical Time-Series (OpenAQ)")
     st.markdown("""
     **How to Read This Chart:**  
-    - This graph shows pollutant trends (like PM2.5) over recent days  
-    - Spikes may indicate pollution events such as wildfires, traffic, or industry  
+    This graph shows pollutant trends over recent days.  
+    Spikes may indicate pollution events such as wildfires, traffic, or industry.
     """)
 
-    st.text(f"[DEBUG] Attempting to fetch: Location='{ts_location}', Parameter='{ts_param}', Days={ts_days}")
-    try:
-        ts_df = fetch_openaq_timeseries(ts_location, ts_param, ts_days, api_key=openaq_key)
-    except Exception:
-        st.warning("⚠️ No data for PM2.5 at primary location. Trying Long Beach-Wintersburg...")
+    all_data = []
+    for ts_param in ts_parameters:
         try:
-            ts_location = "Long Beach-Wintersburg"
-            ts_df = fetch_openaq_timeseries(ts_location, ts_param, ts_days, api_key=openaq_key)
-        except Exception:
-            st.warning("⚠️ Still no data. Showing sample fallback data.")
-            now = datetime.datetime.utcnow()
-            ts_df = pd.DataFrame({
-                "datetime": [now - datetime.timedelta(days=i) for i in range(ts_days)][::-1],
-                "value": [12, 18, 20, 16, 15, 17, 13],
-                "unit": ["µg/m³"] * ts_days
-            })
+            #st.text(f"[DEBUG] Fetching: Location='{selected_location}', Parameter='{ts_param}', Days={ts_days}")
+            ts_df = fetch_openaq_timeseries(selected_location, ts_param, ts_days, api_key=openaq_key)
+            if not ts_df.empty:
+                ts_df["parameter"] = ts_param
+                all_data.append(ts_df)
+        except Exception as e:
+            test = e
+            #st.warning(f"❗ {ts_param.upper()} failed: {e}")
+    if all_data:
+        combined_ts = pd.concat(all_data)
+        fig = px.line(combined_ts, x="datetime", y="value", color="parameter",
+                      title=f"Pollution Trend at {selected_location}")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(f"Data shown from OpenAQ for {selected_location}")
+    else:
+        # If no real data is found, show sample fallback with multiple pollutants
+        st.warning("⚠️ No valid historical data found. Showing fallback sample.")
+        now = datetime.datetime.utcnow()
+        dates = [now - datetime.timedelta(days=i) for i in range(ts_days)][::-1]
+        
+        # Create sample values for multiple pollutants
+        fallback_df = pd.DataFrame({
+            "datetime": dates * 3,
+            "value": [12, 18, 20, 16, 15, 17, 13] + [8, 9, 12, 11, 10, 9, 8] + [25, 22, 24, 21, 23, 22, 20],
+            "parameter": ["pm25"] * ts_days + ["no2"] * ts_days + ["o3"] * ts_days
+        })
+        
+        # Draw a multi-line chart for the fallback data
+        fig = px.line(fallback_df, x="datetime", y="value", color="parameter",
+                    title="Fallback Sample Trend for PM2.5, NO₂, and O₃")
+        fig.update_layout(xaxis_title="Date", yaxis_title="Concentration (µg/m³)")
+        st.plotly_chart(fig, use_container_width=True)
 
-    st.text(f"[DEBUG] Returned dataframe shape: {ts_df.shape}")
-    st.text("[DEBUG] Sample rows:")
-    st.text(ts_df.head().to_string())
-
-    ts_df.set_index("datetime", inplace=True)
-    if chart_type == "Line":
-        st.line_chart(ts_df["value"])
-    elif chart_type == "Bar":
-        st.bar_chart(ts_df["value"])
-    elif chart_type == "Area":
-        st.area_chart(ts_df["value"])
-
-    st.caption(f"Data shown in {ts_df['unit'].iloc[0]} from OpenAQ or fallback.")
-
-    param_info = {
-        "pm25": "Fine particles (≤2.5μm) from smoke, vehicles, and industry. Affects lungs and heart.",
-        "pm10": "Larger particles (≤10μm) like dust and construction debris. May affect breathing.",
-        "no2":  "Nitrogen dioxide from vehicles and power plants. Causes inflammation in airways.",
-        "o3":   "Ground-level ozone formed from emissions + sunlight. Can trigger asthma and smog.",
-        "co":   "Carbon monoxide from incomplete combustion. Dangerous at high levels.",
-        "so2":  "Sulfur dioxide from burning fossil fuels. Can irritate lungs and contribute to acid rain."
-    }
-    st.markdown(f"**About {ts_param.upper()}:** {param_info.get(ts_param, 'No description available.')}")
-
-    # --- Satellite Overlay ---
-    st.subheader("🛰️ NASA Satellite Overlay (MODIS AOD Example)")
+    # --- NASA MODIS GIBS Multi-Layer Overlay ---
+    st.subheader("🛰️ NASA Satellite Overlays (MODIS + More)")
     st.markdown("""
     **What Is MODIS AOD?**  
-    - MODIS = NASA satellite imagery  
-    - AOD = Aerosol Optical Depth (dust, smoke, particles in air)  
+    - AOD = Aerosol Optical Depth, showing smoke, haze, and particles  
+    - Fire layers = thermal anomalies from wildfires and industrial heat  
+    - True Color = visible-light satellite photo (useful for visual reference)  
     """)
-    add_overlay = st.checkbox("🌫️ Show MODIS Aerosol Optical Depth (AOD)")
+    
+    add_overlay = st.checkbox("🌫️ Show Enhanced MODIS Layers", value=True)
     if add_overlay:
         try:
-            today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-            gibs_url = (
-                f"https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/"
-                f"MODIS_Terra_Aerosol/default/{today}/GoogleMapsCompatible_Level9/"
-                "{z}/{y}/{x}.png"
-            )
-            m_overlay = folium.Map(location=[37, -95], zoom_start=4, width='100%', height='100%')
-            folium.raster_layers.TileLayer(
-                tiles=gibs_url,
-                attr="MODIS AOD - NASA GIBS",
-                name="MODIS AOD",
-                overlay=True,
-                control=True,
-                opacity=0.5
-            ).add_to(m_overlay)
+            today = "2024-07-15"  # Use a past date with known data
+            center_lat, center_lon = 36.6, -119.5  # San Joaquin Valley (dust/haze hotspot)
+            m_overlay = folium.Map(location=[center_lat, center_lon], zoom_start=6, width='100%', height='100%')
+    
+            # Define GIBS layers to add
+            layers = {
+                "MODIS AOD": f"https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_Aerosol/default/{today}/GoogleMapsCompatible_Level9/{{z}}/{{y}}/{{x}}.png",
+                "Fires (MODIS)": f"https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/FIRMS_MODIS_All/default/{today}/GoogleMapsCompatible_Level9/{{z}}/{{y}}/{{x}}.png",
+                "Cloud Optical Thickness": f"https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Cloud_Optical_Thickness/default/{today}/GoogleMapsCompatible_Level9/{{z}}/{{y}}/{{x}}.png",
+                "True Color (Day)": f"https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/{today}/GoogleMapsCompatible_Level9/{{z}}/{{y}}/{{x}}.png"
+            }
+    
+            # Add layers
+            for name, url in layers.items():
+                folium.raster_layers.TileLayer(
+                    tiles=url,
+                    name=name,
+                    attr="NASA GIBS",
+                    overlay=True,
+                    control=True,
+                    opacity=0.6
+                ).add_to(m_overlay)
+    
+            # Marker and layer control
+            folium.Marker([center_lat, center_lon], popup="San Joaquin Valley, CA").add_to(m_overlay)
             folium.LayerControl().add_to(m_overlay)
+    
+            # Debug info
+            st.markdown("🛰️ **Debug Info:**")
+            for name, url in layers.items():
+                st.code(f"{name}:\n{url}")
+            st.text(f"Center: lat={center_lat}, lon={center_lon}, Date={today}")
+    
             folium_static(m_overlay)
         except Exception as e:
-            st.error(f"Could not load satellite overlay: {e}")
+            st.error(f"Could not load satellite overlays: {e}")
+    
+        
+            
+    
+        
+    
